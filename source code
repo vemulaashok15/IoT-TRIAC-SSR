@@ -1,0 +1,206 @@
+#include <ESP8266WiFi.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <time.h>
+
+// Wi-Fi credentials
+const char* ssid = "project";
+const char* password = "1234567890";
+
+// Pins
+const uint8_t relayPin = 12;  // D6
+const uint8_t buttonPin = 14; // D5
+
+// Relay and time tracking
+bool relayState = false;
+unsigned long lastButtonPress = 0;
+String relayOnTime = "--";
+String relayOffTime = "--";
+String currentIST = "Fetching...";
+
+// Schedule (default)
+int onHour = 8, onMinute = 0;
+int offHour = 20, offMinute = 0;
+bool hasTurnedOnToday = false, hasTurnedOffToday = false;
+
+// Web server
+AsyncWebServer server(80);
+
+// Timezone for IST
+const long gmtOffset_sec = 19800;
+const int daylightOffset_sec = 0;
+
+// Time formatting
+String getISTTimeString() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  char buf[30];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", timeinfo);
+  return String(buf);
+}
+
+// Relay time tracking
+void updateRelayTime() {
+  currentIST = getISTTimeString();
+  if (relayState) {
+    relayOnTime = currentIST;
+  } else {
+    relayOffTime = currentIST;
+  }
+}
+
+// HTML dashboard with AJAX for real-time time updates
+String dashboardHTML() {
+  String page = "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                "<script src='https://code.jquery.com/jquery-3.6.0.min.js'></script>"
+                "<script>"
+                "setInterval(function() {"
+                "$('#current-time').load(window.location.href + ' #current-time');"
+                "}, 5000);"
+                "</script>"
+                "<title>Relay Control</title><style>"
+                "body{font-family:Arial;text-align:center;padding:30px;}"
+                "button,input{font-size:18px;padding:10px;margin:5px;}</style></head><body>";
+
+  page += "<h1>Relay Control Dashboard</h1>";
+  page += relayState ? "<p style='color:green;'>Relay is ON</p>" : "<p style='color:red;'>Relay is OFF</p>";
+  page += "<button onclick=\"location.href='/on'\">Turn ON</button>";
+  page += "<button onclick=\"location.href='/off'\">Turn OFF</button>";
+
+  page += "<div id='current-time'>";
+  page += "<h3>Current IST Time: " + currentIST + "</h3>";
+  page += "</div>";
+
+  page += "<h3>Last ON Time: " + relayOnTime + "</h3>";
+  page += "<h3>Last OFF Time: " + relayOffTime + "</h3>";
+
+  page += "<h2>Set Schedule</h2>"
+          "<form action='/setSchedule' method='get'>"
+          "ON Time: <input type='time' name='on' value='" + String(onHour) + ":" + (onMinute < 10 ? "0" : "") + String(onMinute) + "' required><br>"
+          "OFF Time: <input type='time' name='off' value='" + String(offHour) + ":" + (offMinute < 10 ? "0" : "") + String(offMinute) + "' required><br>"
+          "<input type='submit' value='Update Schedule'>"
+          "</form>";
+
+  page += "<p>Current Schedule:</p>";
+  page += "<p>ON at " + String(onHour) + ":" + (onMinute < 10 ? "0" : "") + String(onMinute) + "</p>";
+  page += "<p>OFF at " + String(offHour) + ":" + (offMinute < 10 ? "0" : "") + String(offMinute) + "</p>";
+
+  page += "</body></html>";
+  return page;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(relayPin, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
+  digitalWrite(relayPin, LOW);
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Sync time
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov");
+  int tries = 0;
+  while (time(nullptr) < 100000 && tries < 30) {
+    delay(1000);
+    Serial.print(".");
+    tries++;
+  }
+  if (time(nullptr) > 100000) {
+    Serial.println("\nTime synced!");
+    currentIST = getISTTimeString();
+  } else {
+    Serial.println("\nFailed to sync time.");
+  }
+
+  // Web routes
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request){
+    currentIST = getISTTimeString();
+    request->send(200, "text/html", dashboardHTML());
+  });
+
+  server.on("/on", HTTP_GET, [](AsyncWebServerRequest* request){
+    relayState = true;
+    digitalWrite(relayPin, HIGH);
+    updateRelayTime();
+    request->redirect("/");
+  });
+
+  server.on("/off", HTTP_GET, [](AsyncWebServerRequest* request){
+    relayState = false;
+    digitalWrite(relayPin, LOW);
+    updateRelayTime();
+    request->redirect("/");
+  });
+
+  server.on("/setSchedule", HTTP_GET, [](AsyncWebServerRequest* request){
+    if (request->hasParam("on")) {
+      String onTime = request->getParam("on")->value();
+      sscanf(onTime.c_str(), "%d:%d", &onHour, &onMinute);
+    }
+    if (request->hasParam("off")) {
+      String offTime = request->getParam("off")->value();
+      sscanf(offTime.c_str(), "%d:%d", &offHour, &offMinute);
+    }
+    hasTurnedOnToday = false;
+    hasTurnedOffToday = false;
+    request->redirect("/");
+  });
+
+  server.begin();
+}
+
+void loop() {
+  if (digitalRead(buttonPin) == LOW && millis() - lastButtonPress > 500) {
+    relayState = !relayState;
+    digitalWrite(relayPin, relayState ? HIGH : LOW);
+    updateRelayTime();
+    Serial.printf("Button Pressed: Relay %s\n", relayState ? "ON" : "OFF");
+    lastButtonPress = millis();
+  }
+
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+
+  if (!hasTurnedOnToday &&
+      timeinfo->tm_hour == onHour &&
+      timeinfo->tm_min == onMinute &&
+      timeinfo->tm_sec == 0) {
+    relayState = true;
+    digitalWrite(relayPin, HIGH);
+    updateRelayTime();
+    hasTurnedOnToday = true;
+    hasTurnedOffToday = false;
+    Serial.println("Scheduled Relay ON");
+  }
+
+  if (!hasTurnedOffToday &&
+      timeinfo->tm_hour == offHour &&
+      timeinfo->tm_min == offMinute &&
+      timeinfo->tm_sec == 0) {
+    relayState = false;
+    digitalWrite(relayPin, LOW);
+    updateRelayTime();
+    hasTurnedOffToday = true;
+    hasTurnedOnToday = false;
+    Serial.println("Scheduled Relay OFF");
+  }
+
+  if (timeinfo->tm_hour == 0 &&
+      timeinfo->tm_min == 0 &&
+      timeinfo->tm_sec == 0) {
+    hasTurnedOnToday = false;
+    hasTurnedOffToday = false;
+  }
+
+  delay(200);
+}
